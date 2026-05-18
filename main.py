@@ -2,8 +2,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import re
-import torch
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 MODEL_NAME = "gogamza/kobart-base-v2"  # 공개 한글 모델
 
@@ -23,17 +21,33 @@ class InputText(BaseModel):
     max_length: int = Field(128, ge=16, le=512)
     num_beams: int = Field(4, ge=1, le=8)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Running on device: {device}")
+# Try to import heavy ML libraries lazily so the server can start even if they are
+# not installed (e.g., in constrained deployment environments).
+MODEL_AVAILABLE = False
+try:
+    import torch
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
-model.eval()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running on device: {device}")
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
+    model.eval()
+    MODEL_AVAILABLE = True
+except Exception as e:
+    # If imports or model loading fail, keep the app running and return a clear
+    # error from the endpoint.
+    print("ML model not available:", e)
+    tokenizer = None
+    model = None
+    device = None
+
 
 def normalize_text(text: str) -> str:
     text = text.strip()
     text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"([\.\,\!\?])\1+", r"\1", text)
+    text = re.sub(r"([\.\,\!\?])+", r"", text)
 
     tokens = text.split()
     normalized_tokens = []
@@ -42,11 +56,21 @@ def normalize_text(text: str) -> str:
             normalized_tokens.append(token)
     text = " ".join(normalized_tokens)
 
-    text = re.sub(r"(\S)\1{3,}", r"\1", text)
+    text = re.sub(r"(\S){3,}", r"", text)
     return text
+
 
 @app.post("/summary")
 async def summarize(input: InputText):
+    # If the ML model wasn't loaded (e.g., torch/transformers not installed),
+    # return a clear 503 so the process doesn't crash at import time.
+    if not MODEL_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail=("모델이 로드되지 않았습니다. 이 서버는 로컬에서 torch/transformers가 "
+                    "설치되어 있어야 합니다. 또는 Ollama 같은 외부 API를 사용하도록 설정하세요."),
+        )
+
     try:
         cleaned = normalize_text(input.text)
         if not cleaned:
@@ -81,15 +105,20 @@ async def summarize(input: InputText):
         ).strip()
         return {"summary": summary}
 
-    except torch.cuda.OutOfMemoryError as e:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        raise HTTPException(
-            status_code=500,
-            detail="GPU 메모리 부족: max_length를 줄이거나 CPU로 실행해보세요."
-        ) from e
-
     except Exception as e:
+        # Handle CUDA OOM if torch is available
+        try:
+            import torch as _torch
+            if isinstance(e, _torch.cuda.OutOfMemoryError):
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+                raise HTTPException(
+                    status_code=500,
+                    detail="GPU 메모리 부족: max_length를 줄이거나 CPU로 실행해보세요."
+                ) from e
+        except Exception:
+            pass
+
         raise HTTPException(
             status_code=500,
             detail=f"요약 생성 중 오류가 발생했습니다: {e}"
