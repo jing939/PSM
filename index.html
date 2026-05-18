@@ -53,6 +53,7 @@
             font-weight: 600;
             color: #333;
             margin-bottom: 8px;
+
         }
 
         textarea {
@@ -239,12 +240,12 @@
 
         <div class="api-info">
             <strong>🔌 Ollama API 주소</strong>
-            <input type="text" id="apiUrl" value="http://localhost:5000" placeholder="Ollama API 주소를 입력하세요">
+            <input type="text" id="apiUrl" value="http://localhost:5000" placeholder="http://localhost:5000">
         </div>
 
         <div class="input-section">
             <label for="inputText">수정할 문장을 입력하세요</label>
-            <textarea id="inputText" placeholder="예: 오늘 날씨가 좋았다. 나들은갔다."></textarea>
+            <textarea id="inputText" placeholder="예: 오늘 날씨가 좋았다. 나들이를 갔다."></textarea>
         </div>
 
         <div class="options">
@@ -323,28 +324,45 @@
             resultContent.textContent = '수정된 문장이 여기에 표시됩니다.';
 
             try {
-                const response = await fetch('http://localhost:8000/summary', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        text: text,
-                        max_length: 128,
-                        num_beams: 4
-                    })
-                });
+                const apiUrl = apiUrlInput.value.trim() || 'http://localhost:5000';
+            const prompt = `다음 문장을 ${stylePrompts[styleSelect.value]} 형태로 수정해 주세요. 결과는 반드시 한국어로만 작성하고 영어로 번역하거나 섞지 마세요. 원문 의미를 유지하면서 자연스럽게 고치고, 수정된 문장만 출력해 주세요.\n\n${text}\n\n수정된 문장만 출력해 주세요.`;
+            const response = await fetch(`${apiUrl.replace(/\/$/, '')}/api/generate`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    model: modelSelect.value,
+                    prompt: prompt,
+                    max_tokens: 256,
+                    temperature: 0.7,
+                    top_p: 0.9
+                })
+            });
 
-                if (!response.ok) {
-                    const errorData = await response.json().catch(() => ({}));
-                    throw new Error(`API 오류: ${response.status} - ${errorData.detail || 'Unknown error'}`);
+            if (!response.ok) {
+                    const errorText = await response.text();
+                    let errorData = {};
+                    try {
+                        errorData = JSON.parse(errorText);
+                    } catch {
+                        errorData = {};
+                    }
+                    throw new Error(`Ollama API 오류: ${response.status} - ${errorData.detail || errorData.error || errorText || response.statusText}`);
                 }
 
-                const data = await response.json();
-                
-                if (data.summary) {
+                const responseText = await response.text();
+                let data;
+                try {
+                    data = JSON.parse(responseText);
+                } catch {
+                    data = responseText;
+                }
+                const result = parseOllamaResponse(data);
+
+                if (result) {
                     resultContent.classList.remove('placeholder');
-                    resultContent.textContent = data.summary.trim();
+                    resultContent.textContent = result.trim();
                 } else {
                     throw new Error('응답을 받지 못했습니다.');
                 }
@@ -354,7 +372,7 @@
                 let errorMessage = error.message;
                 
                 if (errorMessage.includes('Failed to fetch') || errorMessage.includes('NetworkError')) {
-                    errorMessage = '❌ FastAPI 서버에 연결할 수 없습니다.\n\n터미널에서 실행하세요:\nuvicorn main:app --reload';
+                    errorMessage = '❌ API 서버에 연결할 수 없습니다. 서버가 실행 중인지 확인해 주세요.';
                 }
                 
                 showError(errorMessage);
@@ -362,6 +380,48 @@
                 submitBtn.disabled = false;
                 loading.classList.remove('active');
             }
+        }
+
+        function parseOllamaResponse(data) {
+                    if (!data) return '';
+                    // Handle NDJSON / streaming text (many JSON objects separated by newlines)
+                    if (typeof data === 'string') {
+                        const lines = data.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+                        let out = '';
+                        for (const line of lines) {
+                            try {
+                                const obj = JSON.parse(line);
+                                if (obj.response) out += obj.response;
+                                else if (obj.output) {
+                                    if (typeof obj.output === 'string') out += obj.output;
+                                    else if (Array.isArray(obj.output)) out += obj.output.map(o => o.text || '').join('');
+                                } else if (obj.text) out += obj.text;
+                                else if (typeof obj === 'string') out += obj;
+                            } catch (e) {
+                                out += line + '\n';
+                            }
+                        }
+                        return out.trim();
+                    }
+                    if (data.response) return data.response;
+                    if (data.output) {
+                        const output = Array.isArray(data.output) ? data.output[0] : data.output;
+                        if (!output) return '';
+                        if (typeof output === 'string') return output;
+                        if (output.text) return output.text;
+                        if (output.content) {
+                            if (typeof output.content === 'string') return output.content;
+                            if (Array.isArray(output.content)) {
+                                return output.content.map(item => item.text || '').join('').trim();
+                            }
+                        }
+                    }
+                    if (data.choices && Array.isArray(data.choices) && data.choices.length > 0) {
+                        const choice = data.choices[0];
+                        if (choice.message && choice.message.content) return choice.message.content;
+                        if (choice.text) return choice.text;
+                    }
+                    return '';
         }
 
         function showError(message) {
